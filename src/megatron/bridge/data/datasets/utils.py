@@ -917,6 +917,9 @@ def _chat_tokenize(
             return_assistant_tokens_mask=return_assistant_tokens_mask,
         )
     else:
+        logger.warning("The tokenizer's chat_template does not contain a {% generation %} block, which is required "
+            "for HF's apply_chat_template to produce assistant-only loss masks. Using a fallback method to produce "
+            "the loss mask. Loss masks might not be accurate.")
         message_end_inds = []
         message_roles = []
         gen_prompt = _get_generation_prompt(tokenizer)
