@@ -879,6 +879,70 @@ def _convert_to_openai_messages(source: dict) -> list[dict]:
     return chat
 
 
+def _tool_call_arg_string_to_mapping(messages: list[dict]):
+    for message in messages:
+        if message["role"] == "assistant":
+            for tc in message.get("tool_calls", []) or []:
+                fn = tc.get("function", {})
+                args = fn.get("arguments")
+
+                # Nemotron chat template expects dict here, not JSON string
+                if isinstance(args, str):
+                    fn["arguments"] = json.loads(args)
+    return messages
+
+
+def _get_generation_prompt(tokenizer):
+    tokens_wo_gen_prompt = tokenizer.apply_chat_template([{"role": "system", "content": ""}])['input_ids']
+    # Generation prompt without reasoning is typically longer
+    tokens_w_gen_prompt = tokenizer.apply_chat_template([{"role": "system", "content": ""}], add_generation_prompt=True, enable_thinking=False)['input_ids']
+    return tokens_w_gen_prompt[len(tokens_wo_gen_prompt):]
+
+
+def _chat_tokenize(
+    tokenizer,
+    chat,
+    tools=[],
+    tokenize=True,
+    return_dict=True,
+    return_assistant_tokens_mask=False
+):
+    if return_assistant_tokens_mask:
+        # Chat template has generation keyword, masking is handled by tokenizer
+        return tokenizer.apply_chat_template(
+            chat,
+            tools=tools,
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=return_assistant_tokens_mask,
+        )
+    else:
+        message_end_inds = []
+        message_roles = []
+        gen_prompt = _get_generation_prompt(tokenizer)
+        for message_ind in range(len(chat)):
+            current_tokens = tokenizer.apply_chat_template(chat[:message_ind + 1], tools=tools, tokenize=tokenize)["input_ids"]
+            message_end_inds.append(len(current_tokens))
+            message_roles.append(chat[message_ind]["role"])
+        mask = [1] * len(current_tokens)
+        for i, message_end in enumerate(message_end_inds):
+            message_start = 0 if i == 0 else message_end_inds[i-1]
+            if message_roles[i] == "assistant":
+                # Finding longest matching prefix with generation prompt without reasoning
+                for j in range(len(gen_prompt)):
+                    if gen_prompt[j] != current_tokens[message_start + j]:
+                        break
+                # Checking if full gen_prompt is a prefix of current message
+                if gen_prompt[j] == current_tokens[message_start + j]:
+                    j += 1
+                mask[message_start + j: message_end] = [0] * (message_end - message_start - j)
+        return {
+            "input_ids": current_tokens,
+            "attention_mask": [1] * len(current_tokens),
+            "assistant_masks": mask
+        }
+    
+
 def _chat_preprocess(source: dict, tokenizer: MegatronTokenizer, tool_schemas: Optional[list[Any]] = None) -> dict:
     """
     Preprocess messages to apply chat template and tokenize. Returns a dictionary of tokens.
@@ -927,6 +991,7 @@ def _chat_preprocess(source: dict, tokenizer: MegatronTokenizer, tool_schemas: O
         tools = source.get("tools") or tool_schemas
     else:
         tools = tool_schemas
+    chat = _tool_call_arg_string_to_mapping(chat)
 
     if getattr(tokenizer, "legacy", False):
         tokenizer = tokenizer._tokenizer
@@ -934,27 +999,14 @@ def _chat_preprocess(source: dict, tokenizer: MegatronTokenizer, tool_schemas: O
     # assistant mask only works if chat template has generation keyword
     template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
 
-    if not template_has_generation_kwd:
-        raise ValueError(
-            "The tokenizer's chat_template does not contain a {% generation %} block, which is required "
-            "for HF's apply_chat_template to produce assistant-only loss masks via "
-            "return_assistant_tokens_mask=True. Without it, the loss mask would silently fall back to "
-            "all-ones (loss computed on the entire conversation including system/user tokens). "
-            "To fix this, either: (1) patch the chat_template to wrap assistant content with "
-            "{% generation %}...{% endgeneration %}, or (2) use the legacy special-tokens preprocessing "
-            "path instead of use_hf_tokenizer_chat_template=True."
-        )
-
-    tokenized_chat = tokenizer.apply_chat_template(
+    tokenized_chat = _chat_tokenize(
+        tokenizer,
         chat,
         tools=tools,
         tokenize=True,
         return_dict=True,
-        return_assistant_tokens_mask=True,
+        return_assistant_tokens_mask=template_has_generation_kwd,
     )
-
-    # Choose the last conversation as answer other history are context by finding the last masked token
-    # which indicates end of context and beginning of answer
     input_ids = tokenized_chat.get("input_ids")
     mask = tokenized_chat["assistant_masks"]
 
